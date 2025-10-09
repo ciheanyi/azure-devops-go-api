@@ -31,6 +31,11 @@ const (
 	headerKeyForceMsaPassThrough = "X-VSS-ForceMsaPassThrough"
 	headerKeySession             = "X-TFS-Session"
 	headerUserAgent              = "User-Agent"
+	headerKeyWWWAuthenticate     = "WWW-Authenticate"
+
+	// CAE (Continuous Access Evaluation) constants
+	caeErrorInsufficientClaims = "insufficient_claims"
+	caeClientCapability        = "cp1"
 
 	// media types
 	MediaTypeTextPlain       = "text/plain"
@@ -74,6 +79,7 @@ func NewClientWithOptions(connection *Connection, baseUrl string, options ...Cli
 		suppressFedAuthRedirect: connection.SuppressFedAuthRedirect,
 		forceMsaPassThrough:     connection.ForceMsaPassThrough,
 		userAgent:               connection.UserAgent,
+		clientCapabilities:      []string{}, // Initialize empty capabilities
 	}
 	for _, fn := range options {
 		fn(client)
@@ -88,13 +94,90 @@ type Client struct {
 	suppressFedAuthRedirect bool
 	forceMsaPassThrough     bool
 	userAgent               string
+	clientCapabilities      []string
+	tokenRefreshHandler     TokenRefreshHandler
 }
 
 func (client *Client) SendRequest(request *http.Request) (response *http.Response, err error) {
 	resp, err := client.client.Do(request) // todo: add retry logic
 	if resp != nil && (resp.StatusCode < 200 || resp.StatusCode >= 300) {
+		// Check for CAE challenge before unwrapping general error
+		if resp.StatusCode == http.StatusUnauthorized {
+			if caeChallenge, isCAE := client.extractCAEChallenge(resp); isCAE {
+				return resp, &CAEChallengeError{
+					ClaimsChallenge: caeChallenge,
+					StatusCode:      resp.StatusCode,
+					Message:         "Continuous Access Evaluation challenge received",
+				}
+			}
+		}
+		// Check for CAE challenge before unwrapping general error
+		if resp.StatusCode == http.StatusUnauthorized {
+			if caeChallenge, isCAE := client.extractCAEChallenge(resp); isCAE {
+				return resp, &CAEChallengeError{
+					ClaimsChallenge: caeChallenge,
+					StatusCode:      resp.StatusCode,
+					Message:         "Continuous Access Evaluation challenge received",
+				}
+			}
+		}
 		err = client.UnwrapError(resp)
 	}
+	return resp, err
+}
+
+// extractCAEChallenge checks if the response contains a CAE challenge and extracts the claims
+func (client *Client) extractCAEChallenge(resp *http.Response) (string, bool) {
+	if resp.StatusCode != http.StatusUnauthorized {
+		return "", false
+	}
+
+	wwwAuthHeader := resp.Header.Get(headerKeyWWWAuthenticate)
+	if wwwAuthHeader == "" {
+		return "", false
+	}
+
+	// Parse WWW-Authenticate header for CAE challenge
+	if strings.Contains(wwwAuthHeader, caeErrorInsufficientClaims) {
+		// Extract claims parameter using regex
+		claimsRegex := regexp.MustCompile(`claims="([^"]+)"`)
+		matches := claimsRegex.FindStringSubmatch(wwwAuthHeader)
+		if len(matches) > 1 {
+			return matches[1], true
+		}
+	}
+
+	return "", false
+}
+
+// SendWithCAERetry sends a request with automatic CAE challenge handling
+func (client *Client) SendWithCAERetry(ctx context.Context,
+	httpMethod string,
+	locationId uuid.UUID,
+	apiVersion string,
+	routeValues map[string]string,
+	queryParameters url.Values,
+	body io.Reader,
+	mediaType string,
+	acceptMediaType string,
+	additionalHeaders map[string]string) (response *http.Response, err error) {
+
+	// First attempt
+	resp, err := client.Send(ctx, httpMethod, locationId, apiVersion, routeValues, queryParameters, body, mediaType, acceptMediaType, additionalHeaders)
+	
+	// Check if we got a CAE challenge
+	if caeErr, ok := err.(*CAEChallengeError); ok && client.tokenRefreshHandler != nil {
+		// Attempt to refresh token with claims challenge
+		newToken, refreshErr := client.tokenRefreshHandler.RefreshTokenWithClaims(ctx, caeErr.ClaimsChallenge)
+		if refreshErr != nil {
+			return nil, refreshErr
+		}
+		
+		// Update authorization and retry
+		client.authorization = "Bearer " + newToken
+		return client.Send(ctx, httpMethod, locationId, apiVersion, routeValues, queryParameters, body, mediaType, acceptMediaType, additionalHeaders)
+	}
+	
 	return resp, err
 }
 
@@ -241,6 +324,26 @@ func setApiResourceLocationCache(url string, locationsMap *map[uuid.UUID]ApiReso
 	apiResourceLocationCacheLock.Lock()
 	defer apiResourceLocationCacheLock.Unlock()
 	apiResourceLocationCache[url] = locationsMap
+}
+
+// IsCAEEnabled returns true if Continuous Access Evaluation is enabled for this client
+func (client *Client) IsCAEEnabled() bool {
+	for _, capability := range client.clientCapabilities {
+		if capability == caeClientCapability {
+			return true
+		}
+	}
+	return false
+}
+
+// GetClientCapabilities returns the client capabilities
+func (client *Client) GetClientCapabilities() []string {
+	return client.clientCapabilities
+}
+
+// SetTokenRefreshHandler sets the token refresh handler for CAE
+func (client *Client) SetTokenRefreshHandler(handler TokenRefreshHandler) {
+	client.tokenRefreshHandler = handler
 }
 
 func (client *Client) getResourceLocationsFromServer(ctx context.Context) ([]ApiResourceLocation, error) {

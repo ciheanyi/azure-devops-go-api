@@ -4,6 +4,7 @@
 package azuredevops
 
 import (
+	"context"
 	"encoding/json"
 	"strconv"
 	"strings"
@@ -146,4 +147,20 @@ func (e WrappedError) Error() string {
 		return ""
 	}
 	return *e.Message
+}
+
+// CAEChallengeError represents a Continuous Access Evaluation challenge
+type CAEChallengeError struct {
+	ClaimsChallenge string
+	StatusCode      int
+	Message         string
+}
+
+func (e *CAEChallengeError) Error() string {
+	return e.Message
+}
+
+// TokenRefreshHandler interface for handling token refresh with CAE claims
+type TokenRefreshHandler interface {
+	RefreshTokenWithClaims(ctx context.Context, claimsChallenge string) (string, error)
 }
