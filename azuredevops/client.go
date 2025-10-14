@@ -78,7 +78,6 @@ func NewClientWithOptions(connection *Connection, baseUrl string, options ...Cli
 		suppressFedAuthRedirect: connection.SuppressFedAuthRedirect,
 		forceMsaPassThrough:     connection.ForceMsaPassThrough,
 		userAgent:               connection.UserAgent,
-		clientCapabilities:      []string{}, // Initialize empty capabilities
 	}
 	for _, fn := range options {
 		fn(client)
@@ -93,7 +92,6 @@ type Client struct {
 	suppressFedAuthRedirect bool
 	forceMsaPassThrough     bool
 	userAgent               string
-	clientCapabilities      []string
 }
 
 func (client *Client) SendRequest(request *http.Request) (response *http.Response, err error) {
